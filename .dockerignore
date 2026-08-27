@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+.git/
+.local/
+.venv/
+tmp/
+output/
+test_paper/
+論文/
