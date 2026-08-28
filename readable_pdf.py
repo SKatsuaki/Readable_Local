@@ -691,7 +691,7 @@ def extract_layout_pages(input_pdf: Path, page_images: list[Path]) -> list[PageL
     with pdfplumber.open(str(input_pdf)) as pdf:
         for index, page in enumerate(pdf.pages):
             image_path = page_images[index] if index < len(page_images) else page_images[-1]
-            words = page.extract_words(x_tolerance=1, y_tolerance=3, keep_blank_chars=False)
+            words = extract_page_words(page)
             upright_words = [word for word in words if word.get("upright", True)]
             lines = words_to_lines(upright_words, split_gaps=True)
             regions = lines_to_regions(lines, float(page.width), float(page.height))
@@ -739,7 +739,7 @@ def looks_garbled_text(text: str) -> bool:
 
 
 def extract_page_text(page: object) -> str:
-    words = page.extract_words(x_tolerance=1, y_tolerance=3, keep_blank_chars=False)
+    words = extract_page_words(page)
     if words:
         lines = words_to_lines(words)
         raw_lines = words_to_lines(words, split_gaps=False)
@@ -752,6 +752,58 @@ def extract_page_text(page: object) -> str:
             return clean_extracted_text(column_text)
     raw = page.extract_text(x_tolerance=1, y_tolerance=3, layout=True) or ""
     return clean_extracted_text(raw)
+
+
+def extract_page_words(page: object) -> list[dict]:
+    """Extract words after dropping duplicate PDF/OCR text layers.
+
+    Scanned PDFs often contain an invisible OCR layer on top of a visible one.
+    Some producers even add the same layer twice. If both layers are used for
+    layout reconstruction, their almost-identical rectangles each receive a
+    translation and the Japanese text is rendered on top of itself.
+    """
+    cleaned_page = dedupe_page_chars(page)
+    words = cleaned_page.extract_words(x_tolerance=1, y_tolerance=3, keep_blank_chars=False)
+    return dedupe_overlapping_words(words)
+
+
+def dedupe_page_chars(page: object) -> object:
+    dedupe = getattr(page, "dedupe_chars", None)
+    if not callable(dedupe):
+        return page
+    try:
+        # Do not include font metadata in the comparison: visible and hidden
+        # OCR layers frequently use different fonts at the same coordinates.
+        return dedupe(tolerance=1, extra_attrs=())
+    except TypeError:
+        # Older pdfplumber versions do not expose extra_attrs.
+        return dedupe(tolerance=1)
+
+
+def dedupe_overlapping_words(words: list[dict], tolerance: float = 1.0) -> list[dict]:
+    """Remove same-text words occupying the same visible position."""
+    unique: list[dict] = []
+    by_text: dict[str, list[dict]] = {}
+    for word in words:
+        text = str(word.get("text", "")).strip()
+        if not text:
+            continue
+        candidates = by_text.setdefault(text, [])
+        x0 = float(word["x0"])
+        x1 = float(word["x1"])
+        top = float(word["top"])
+        bottom = float(word.get("bottom", top))
+        if any(
+            abs(x0 - float(existing["x0"])) <= tolerance
+            and abs(x1 - float(existing["x1"])) <= tolerance
+            and abs(top - float(existing["top"])) <= tolerance
+            and abs(bottom - float(existing.get("bottom", existing["top"]))) <= tolerance
+            for existing in candidates
+        ):
+            continue
+        candidates.append(word)
+        unique.append(word)
+    return unique
 
 
 def words_to_lines(words: list[dict], split_gaps: bool = True) -> list[dict]:
@@ -775,7 +827,13 @@ def words_to_lines(words: list[dict], split_gaps: bool = True) -> list[dict]:
                 continue
             previous = segments[-1][-1]
             gap = float(word["x0"]) - float(previous["x1"])
-            if split_gaps and gap > 10:
+            # A fixed 10 pt threshold split justified prose into several
+            # overlay boxes. Use the local glyph height instead so normal word
+            # spacing remains one line while genuinely separated labels and
+            # columns can still be treated independently.
+            previous_height = float(previous.get("bottom", previous["top"])) - float(previous["top"])
+            gap_threshold = max(16.0, previous_height * 2.4)
+            if split_gaps and gap > gap_threshold:
                 segments.append([word])
             else:
                 segments[-1].append(word)
@@ -880,7 +938,40 @@ def lines_to_regions(lines: list[dict], page_width: float, page_height: float) -
     regions: list[TextRegion] = []
     for bucket_name in ("full", "left", "right"):
         regions.extend(group_lines_into_regions(buckets[bucket_name], page_width, page_height))
-    return sorted(regions, key=lambda item: (item.top, item.x0))
+    return select_nonconflicting_overlay_regions(regions)
+
+
+def select_nonconflicting_overlay_regions(regions: list[TextRegion]) -> list[TextRegion]:
+    """Keep one region when malformed source boxes substantially overlap.
+
+    Small edge contact is normal for adjacent text lines, so only an overlap
+    covering at least half of the smaller source rectangle is considered a
+    conflict. The larger text block is normally the usable OCR result; the
+    other block is left as the original page image instead of drawing two
+    translations in the same place.
+    """
+    accepted: list[TextRegion] = []
+    candidates = sorted(
+        regions,
+        key=lambda item: (len(item.text.strip()), (item.x1 - item.x0) * (item.bottom - item.top)),
+        reverse=True,
+    )
+    for region in candidates:
+        if region.translatable and any(
+            other.translatable and overlay_region_overlap(region, other) >= 0.5 for other in accepted
+        ):
+            continue
+        accepted.append(region)
+    return sorted(accepted, key=lambda item: (item.top, item.x0))
+
+
+def overlay_region_overlap(first: TextRegion, second: TextRegion) -> float:
+    overlap_w = max(0.0, min(first.x1, second.x1) - max(first.x0, second.x0))
+    overlap_h = max(0.0, min(first.bottom, second.bottom) - max(first.top, second.top))
+    intersection = overlap_w * overlap_h
+    first_area = max(0.0, first.x1 - first.x0) * max(0.0, first.bottom - first.top)
+    second_area = max(0.0, second.x1 - second.x0) * max(0.0, second.bottom - second.top)
+    return intersection / min(first_area, second_area) if intersection and first_area and second_area else 0.0
 
 
 def is_margin_artifact(line: dict, page_width: float, page_height: float) -> bool:
@@ -1555,6 +1646,12 @@ def draw_translated_region(pdf: canvas.Canvas, region: TextRegion, page_w: float
 
     pdf.setFillColor(colors.white)
     pdf.rect(x, y, w, h, stroke=0, fill=1)
+    # ReportLab does not clip drawString() by default. Keep every glyph inside
+    # its source rectangle even when a PDF reports an unusually small line box.
+    pdf.saveState()
+    clip = pdf.beginPath()
+    clip.rect(x, y, w, h)
+    pdf.clipPath(clip, stroke=0, fill=0)
     pdf.setFillColor(colors.HexColor("#172026"))
     pdf.setFont(FONT_GOTHIC, font_size)
 
@@ -1567,7 +1664,7 @@ def draw_translated_region(pdf: canvas.Canvas, region: TextRegion, page_w: float
             break
         pdf.drawString(x + 1.1, text_y, line)
         text_y -= line_h
-
+    pdf.restoreState()
 
 def compact_overlay_text(text: str) -> str:
     text = normalize_math_symbols(text)

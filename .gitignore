@@ -7,3 +7,6 @@ __pycache__/
 !.env.example
 .venv/
 venv/
+.singularity/
+.readable-singularity/
+*.sif
